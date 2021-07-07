@@ -123,18 +123,31 @@ func (ex *Executor) resolveServerNetworks(machineName string) ([]servers.Network
 				securityGroupIDs = append(securityGroupIDs, securityGroupID)
 			}
 
-			port, err := ex.Network.CreatePort(&ports.CreateOpts{
-				Name:                machineName,
-				NetworkID:           ex.Config.Spec.NetworkID,
-				FixedIPs:            []ports.IP{{SubnetID: *ex.Config.Spec.SubnetID}},
-				AllowedAddressPairs: []ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
-				SecurityGroups:      &securityGroupIDs,
-			})
-			if err != nil {
-				return nil, nil, err
+			var (
+				portID string
+				err    error
+			)
+			portID, err = ex.Network.PortIDFromName(machineName)
+			if err != nil && !client.IsNotFoundError(err) {
+				return nil, nil, fmt.Errorf("error fetching port with name %q: %s", machineName, err)
 			}
-			klog.V(3).Infof("port [ID=%q] successfully created", port.ID)
-			serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID, Port: port.ID})
+			if client.IsNotFoundError(err) {
+				port, err := ex.Network.CreatePort(&ports.CreateOpts{
+					Name:                machineName,
+					NetworkID:           ex.Config.Spec.NetworkID,
+					FixedIPs:            []ports.IP{{SubnetID: *ex.Config.Spec.SubnetID}},
+					AllowedAddressPairs: []ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
+					SecurityGroups:      &securityGroupIDs,
+				})
+				if err != nil {
+					return nil, nil, err
+				}
+
+				portID = port.ID
+			}
+
+			klog.V(3).Infof("port [ID=%q] successfully created", portID)
+			serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID, Port: portID})
 		}
 		podNetworkIDs[networkID] = struct{}{}
 	} else {
