@@ -19,7 +19,7 @@ import (
 
 	"github.com/gardener/machine-controller-manager-provider-openstack/pkg/apis/cloudprovider"
 	"github.com/gardener/machine-controller-manager-provider-openstack/pkg/apis/openstack"
-	client "github.com/gardener/machine-controller-manager-provider-openstack/pkg/client"
+	"github.com/gardener/machine-controller-manager-provider-openstack/pkg/client"
 	. "github.com/gardener/machine-controller-manager-provider-openstack/pkg/driver/executor"
 	mocks "github.com/gardener/machine-controller-manager-provider-openstack/pkg/mock/openstack"
 )
@@ -83,7 +83,6 @@ var _ = Describe("Executor", func() {
 					PodNetworkCidr: podCidr,
 				},
 			}
-
 		})
 
 		It("should take the happy path", func() {
@@ -190,10 +189,35 @@ var _ = Describe("Executor", func() {
 
 	Context("#GetMachineStatus", func() {
 		var (
-			serverList []servers.Server
+			podNetworkID   = "networkID"
+			podNetworkCIDR = "1.1.0.0/16"
+			serverList     []servers.Server
+			portList       []ports.Port
 		)
 
 		BeforeEach(func() {
+			cfg = &openstack.MachineProviderConfig{
+				Spec: openstack.MachineProviderConfigSpec{
+					Tags:           tags,
+					NetworkID:      podNetworkID,
+					Region:         region,
+					PodNetworkCidr: podNetworkCIDR,
+				},
+			}
+			portList = []ports.Port{
+				{
+					ID:        "id1",
+					NetworkID: podNetworkID,
+					AllowedAddressPairs: []ports.AddressPair{
+						{
+							IPAddress: podNetworkCIDR,
+						},
+					},
+				},
+				{
+					ID: "id2",
+				},
+			}
 			serverList = []servers.Server{
 				{
 					Metadata: tags,
@@ -226,17 +250,20 @@ var _ = Describe("Executor", func() {
 			}
 		})
 
-		table.DescribeTable("#Status", func(name string, expectedID string, expectedErr error) {
+		table.DescribeTable("#ServerCheck", func(name string, expectedID string, expectedServerErr error) {
 			compute.EXPECT().ListServers(&servers.ListOpts{Name: name}).Return(serverList, nil)
+			if expectedServerErr == nil {
+				network.EXPECT().ListPorts(&ports.ListOpts{DeviceID: expectedID}).Return(portList, nil)
+			}
 			ex := Executor{
 				Compute: compute,
 				Network: network,
 				Config:  cfg,
 			}
 			providerID, err := ex.GetMachineStatus(ctx, name)
-			if expectedErr != nil {
+			if expectedServerErr != nil {
 				Expect(err).ToNot(BeNil())
-				Expect(errors.Is(err, expectedErr)).To(BeTrue())
+				Expect(errors.Is(err, expectedServerErr)).To(BeTrue())
 			} else {
 				Expect(err).To(BeNil())
 				Expect(providerID).To(Equal(EncodeProviderID(region, expectedID)))
@@ -246,6 +273,46 @@ var _ = Describe("Executor", func() {
 			table.Entry("Should return not found if name not exists", "unknown", "", ErrNotFound),
 			table.Entry("Should return not found if name exists without matching metadata", "baz", "", ErrNotFound),
 			table.Entry("Should detect multiple matching servers", "lorem", "", ErrMultipleFound),
+		)
+
+		table.DescribeTable("#PortCheck", func(name string, expectedID string, portList []ports.Port, isError bool) {
+			compute.EXPECT().ListServers(&servers.ListOpts{Name: name}).Return(serverList, nil)
+			network.EXPECT().ListPorts(&ports.ListOpts{DeviceID: expectedID}).Return(portList, nil)
+
+			ex := Executor{
+				Compute: compute,
+				Network: network,
+				Config:  cfg,
+			}
+			providerID, err := ex.GetMachineStatus(ctx, name)
+			if isError {
+				Expect(err).ToNot(BeNil())
+			} else {
+				Expect(err).To(BeNil())
+				Expect(providerID).To(Equal(EncodeProviderID(region, expectedID)))
+			}
+		},
+			table.Entry("should return error if no ports are found", "foo", "id1", []ports.Port{}, true),
+			table.Entry("should return error if port doesn't support allowedPair", "foo", "id1", []ports.Port{
+				{
+					NetworkID: podNetworkID,
+				},
+			}, true),
+			table.Entry("should return error if no port found for the pod network", "foo", "id1", []ports.Port{
+				{
+					NetworkID: "randomID",
+				},
+			}, true),
+			table.Entry("should succeed", "foo", "id1", []ports.Port{
+				{
+					NetworkID: podNetworkID,
+					AllowedAddressPairs: []ports.AddressPair{
+						{
+							IPAddress: podNetworkCIDR,
+						},
+					},
+				},
+			}, false),
 		)
 	})
 

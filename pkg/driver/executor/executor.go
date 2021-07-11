@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/gardener/machine-controller-manager-provider-openstack/pkg/apis/cloudprovider"
 	api "github.com/gardener/machine-controller-manager-provider-openstack/pkg/apis/openstack"
 	"github.com/gardener/machine-controller-manager-provider-openstack/pkg/client"
@@ -57,7 +59,7 @@ func NewExecutor(factory *client.Factory, config *api.MachineProviderConfig) (*E
 // CreateMachine creates a new OpenStack server instance and waits until it reports "ACTIVE".
 // If there is an error during the build process, or if the building phase timeouts, it will delete any artifacts created.
 func (ex *Executor) CreateMachine(ctx context.Context, machineName string, userData []byte) (string, error) {
-	serverNetworks, podNetworkIDs, err := ex.resolveServerNetworks(machineName)
+	serverNetworks, err := ex.computeServerNetworks(machineName)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve server networks: %w", err)
 	}
@@ -83,81 +85,134 @@ func (ex *Executor) CreateMachine(ctx context.Context, machineName string, userD
 		return "", deleteOnFail(fmt.Errorf("error waiting for server [ID=%q] to reach target status: %w", server.ID, err))
 	}
 
-	if err := ex.patchServerPortsForPodNetwork(server.ID, podNetworkIDs); err != nil {
+	if err := ex.patchServerPortsForPodNetwork(server.ID); err != nil {
 		return "", deleteOnFail(fmt.Errorf("failed to patch server [ID=%q] ports: %s", server.ID, err))
 	}
 	return providerID, nil
 }
 
-// resolveServerNetworks resolves the network configuration for a server.
-// It returns a list of networks that the server should be part of and a map of Network IDs that are part of the Pod Network.
-func (ex *Executor) resolveServerNetworks(machineName string) ([]servers.Network, map[string]struct{}, error) {
+func (ex *Executor) computeServerNetworks(machineName string) ([]servers.Network, error) {
 	var (
 		networkID      = ex.Config.Spec.NetworkID
 		subnetID       = ex.Config.Spec.SubnetID
 		networks       = ex.Config.Spec.Networks
 		serverNetworks = make([]servers.Network, 0)
-		podNetworkIDs  = make(map[string]struct{})
 	)
 
 	klog.V(3).Infof("resolving network setup for machine %q", machineName)
 	// If NetworkID is specified in the spec, we deploy the VMs in an existing Network.
 	// If SubnetID is specified in addition to NetworkID, we have to preallocate a Neutron Port to force the VMs to get IP from the subnet's range.
-	if !isEmptyString(pointer.StringPtr(networkID)) {
+	if !isEmptyString(pointer.StringPtr(networkID)) && !isEmptyString(subnetID) {
 		klog.V(3).Infof("deploying in existing network [ID=%q]", networkID)
-		if isEmptyString(ex.Config.Spec.SubnetID) {
-			// if no SubnetID is specified, use only the NetworkID for the network attachments.
-			serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID})
-		} else {
-			klog.V(3).Infof("deploying in existing subnet [ID=%q]. Pre-allocating Neutron Port... ", *subnetID)
-			if _, err := ex.Network.GetSubnet(*subnetID); err != nil {
-				return nil, nil, err
-			}
-
-			var securityGroupIDs []string
-			for _, securityGroup := range ex.Config.Spec.SecurityGroups {
-				securityGroupID, err := ex.Network.GroupIDFromName(securityGroup)
-				if err != nil {
-					return nil, nil, err
-				}
-				securityGroupIDs = append(securityGroupIDs, securityGroupID)
-			}
-
-			port, err := ex.Network.CreatePort(&ports.CreateOpts{
-				Name:                machineName,
-				NetworkID:           ex.Config.Spec.NetworkID,
-				FixedIPs:            []ports.IP{{SubnetID: *ex.Config.Spec.SubnetID}},
-				AllowedAddressPairs: []ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
-				SecurityGroups:      &securityGroupIDs,
-			})
-			if err != nil {
-				return nil, nil, err
-			}
-			klog.V(3).Infof("port [ID=%q] successfully created", port.ID)
-			serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID, Port: port.ID})
+		klog.V(3).Infof("deploying in existing subnet [ID=%q]. Pre-allocating Neutron Port... ", *subnetID)
+		if _, err := ex.Network.GetSubnet(*subnetID); err != nil {
+			return nil, err
 		}
-		podNetworkIDs[networkID] = struct{}{}
+
+		var securityGroupIDs []string
+		for _, securityGroup := range ex.Config.Spec.SecurityGroups {
+			securityGroupID, err := ex.Network.GroupIDFromName(securityGroup)
+			if err != nil {
+				return nil, err
+			}
+			securityGroupIDs = append(securityGroupIDs, securityGroupID)
+		}
+
+		port, err := ex.Network.CreatePort(&ports.CreateOpts{
+			Name:                machineName,
+			NetworkID:           ex.Config.Spec.NetworkID,
+			FixedIPs:            []ports.IP{{SubnetID: *ex.Config.Spec.SubnetID}},
+			AllowedAddressPairs: []ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
+			SecurityGroups:      &securityGroupIDs,
+		})
+		if err != nil {
+			return nil, err
+		}
+		klog.V(3).Infof("port [ID=%q] successfully created", port.ID)
+		serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID, Port: port.ID})
+
+		return serverNetworks, nil
+	} else if !isEmptyString(pointer.StringPtr(networkID)) {
+		// if no SubnetID is specified, use only the NetworkID for the network attachments.
+		serverNetworks = append(serverNetworks, servers.Network{UUID: ex.Config.Spec.NetworkID})
+
+		return serverNetworks, nil
+	}
+
+	for _, network := range networks {
+		var (
+			resolvedNetworkID string
+			err               error
+		)
+		if isEmptyString(pointer.StringPtr(network.Id)) {
+			resolvedNetworkID, err = ex.Network.NetworkIDFromName(network.Name)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			resolvedNetworkID = network.Id
+		}
+		serverNetworks = append(serverNetworks, servers.Network{UUID: resolvedNetworkID})
+	}
+
+	return serverNetworks, nil
+
+}
+
+func (ex *Executor) computePodNetworkIDs(serverID string) ([]ports.Port, error) {
+	var (
+		networkID  = ex.Config.Spec.NetworkID
+		networks   = ex.Config.Spec.Networks
+		networkIDs = sets.NewString()
+		result     []ports.Port
+	)
+
+	if !isEmptyString(pointer.StringPtr(networkID)) {
+		networkIDs.Insert(networkID)
 	} else {
 		for _, network := range networks {
-			var (
-				resolvedNetworkID string
-				err               error
-			)
-			if isEmptyString(pointer.StringPtr(network.Id)) {
-				resolvedNetworkID, err = ex.Network.NetworkIDFromName(network.Name)
-				if err != nil {
-					return nil, nil, err
-				}
-			} else {
-				resolvedNetworkID = network.Id
-			}
-			serverNetworks = append(serverNetworks, servers.Network{UUID: resolvedNetworkID})
 			if network.PodNetwork {
-				podNetworkIDs[resolvedNetworkID] = struct{}{}
+				var (
+					resolvedNetworkID string
+					err               error
+				)
+
+				if isEmptyString(pointer.StringPtr(network.Id)) {
+					resolvedNetworkID, err = ex.Network.NetworkIDFromName(network.Name)
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					resolvedNetworkID = network.Id
+				}
+				networkIDs.Insert(resolvedNetworkID)
 			}
 		}
 	}
-	return serverNetworks, podNetworkIDs, nil
+
+	serverPorts, err := ex.Network.ListPorts(&ports.ListOpts{
+		DeviceID: serverID,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ports: %v", err)
+	}
+
+	if len(serverPorts) == 0 {
+		return nil, fmt.Errorf("got an empty port list for server %q", serverID)
+	}
+
+	for _, port := range serverPorts {
+		if networkIDs.Has(port.NetworkID) {
+			result = append(result, port)
+		}
+	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no port candidates found for pod network")
+	}
+
+	return result, nil
 }
 
 // waitForStatus blocks until the server with the specified ID reaches one of the target status.
@@ -282,27 +337,17 @@ func resourceInstanceBlockDevicesV2(rootDiskSize int, imageID string) ([]bootfro
 }
 
 // patchServerPortsForPodNetwork updates a server's ports with rules for whitelisting the pod network CIDR.
-func (ex *Executor) patchServerPortsForPodNetwork(serverID string, podNetworkIDs map[string]struct{}) error {
-	allPorts, err := ex.Network.ListPorts(&ports.ListOpts{
-		DeviceID: serverID,
-	})
+func (ex *Executor) patchServerPortsForPodNetwork(serverID string) error {
+	podNetworkPorts, err := ex.computePodNetworkIDs(serverID)
 	if err != nil {
-		return fmt.Errorf("failed to get ports: %v", err)
+		return err
 	}
 
-	if len(allPorts) == 0 {
-		return fmt.Errorf("got an empty port list for server %q", serverID)
-	}
-
-	for _, port := range allPorts {
-		for id := range podNetworkIDs {
-			if port.NetworkID == id {
-				if err := ex.Network.UpdatePort(port.ID, ports.UpdateOpts{
-					AllowedAddressPairs: &[]ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
-				}); err != nil {
-					return fmt.Errorf("failed to update allowed address pair for port [ID=%q]: %v", port.ID, err)
-				}
-			}
+	for _, port := range podNetworkPorts {
+		if err := ex.Network.UpdatePort(port.ID, ports.UpdateOpts{
+			AllowedAddressPairs: &[]ports.AddressPair{{IPAddress: ex.Config.Spec.PodNetworkCidr}},
+		}); err != nil {
+			return fmt.Errorf("failed to update allowed address pair for port [ID=%q]: %v", port.ID, err)
 		}
 	}
 	return nil
@@ -465,7 +510,30 @@ func (ex *Executor) GetMachineStatus(ctx context.Context, machineName string) (s
 		return "", err
 	}
 
+	err = ex.verifyServerPortsForPodNetwork(server.ID)
+	if err != nil {
+		return "", err
+	}
+
 	return EncodeProviderID(ex.Config.Spec.Region, server.ID), nil
+}
+
+func (ex *Executor) verifyServerPortsForPodNetwork(serverID string) error {
+	podNetworkPorts, err := ex.computePodNetworkIDs(serverID)
+	if err != nil {
+		return err
+	}
+
+outerLoop:
+	for _, port := range podNetworkPorts {
+		for _, addressPair := range port.AllowedAddressPairs {
+			if addressPair.IPAddress == ex.Config.Spec.PodNetworkCidr {
+				continue outerLoop
+			}
+		}
+		return fmt.Errorf("port [ID=%q] of server [ID=%q] is not configured for pod network, but it should", port.ID, serverID)
+	}
+	return nil
 }
 
 // ListMachines lists all servers.
