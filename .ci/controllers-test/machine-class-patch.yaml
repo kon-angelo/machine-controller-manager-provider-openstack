@@ -1,0 +1,5 @@
+providerSpec:
+  spec:
+    tags:
+      kubernetes.io-role-integration-test: "1"
+      kubernetes.io-cluster-integration-test: "1"
