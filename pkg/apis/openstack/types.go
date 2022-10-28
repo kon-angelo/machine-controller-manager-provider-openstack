@@ -52,6 +52,8 @@ type MachineProviderConfigSpec struct {
 	// Networks is a list of networks the instance should belong to. Networks is mutually exclusive with the NetworkID option
 	// and only one should be specified.
 	Networks []OpenStackNetwork
+	// Disks is a list of (non-bootable) Disks that should be attached to the machine.
+	Disks []OpenStackDisk `json:"dataDisk,omitempty"`
 }
 
 // OpenStackNetwork describes a network this instance should belong to.
@@ -62,4 +64,18 @@ type OpenStackNetwork struct {
 	Name string
 	// PodNetwork specifies whether this network is part of the pod network.
 	PodNetwork bool
+}
+
+// OpenStackDisk is the specification for a disk that should be attached to the machine.
+type OpenStackDisk struct {
+	// Name is the name of the volume
+	Name string
+	// Type is the disk type for the volume. If left empty the default type will be used.
+	Type string
+	// Metadata is a list of key-value pairs used as metadata for the volume.
+	Metadata map[string]string
+	// Size is the size of the volume in GB.
+	Size int
+	// DeleteOnTermination indicates if the volume should be deleted on VM termination.
+	DeleteOnTermination bool
 }

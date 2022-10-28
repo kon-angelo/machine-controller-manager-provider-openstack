@@ -193,7 +193,7 @@ func (ex *Executor) waitForServerStatus(serverID string, pending []string, targe
 func (ex *Executor) deployServer(machineName string, userData []byte, nws []servers.Network) (*servers.Server, error) {
 	keyName := ex.Config.Spec.KeyName
 	imageName := ex.Config.Spec.ImageName
-	imageID := ex.Config.Spec.ImageID
+	imageId := ex.Config.Spec.ImageID
 	securityGroups := ex.Config.Spec.SecurityGroups
 	availabilityZone := ex.Config.Spec.AvailabilityZone
 	metadata := ex.Config.Spec.Tags
@@ -207,9 +207,9 @@ func (ex *Executor) deployServer(machineName string, userData []byte, nws []serv
 		err        error
 	)
 
-	// use imageID if provided, otherwise try to resolve the imageName to an imageID
-	if imageID != "" {
-		imageRef = imageID
+	// use imageId if provided, otherwise try to resolve the imageName to an imageId
+	if imageId != "" {
+		imageRef = imageId
 	} else {
 		imageRef, err = ex.Compute.ImageIDFromName(imageName)
 		if err != nil {
@@ -223,13 +223,13 @@ func (ex *Executor) deployServer(machineName string, userData []byte, nws []serv
 
 	createOpts = &servers.CreateOpts{
 		Name:             machineName,
-		FlavorRef:        flavorRef,
 		ImageRef:         imageRef,
-		Networks:         nws,
+		FlavorRef:        flavorRef,
 		SecurityGroups:   securityGroups,
-		Metadata:         metadata,
 		UserData:         userData,
 		AvailabilityZone: availabilityZone,
+		Networks:         nws,
+		Metadata:         metadata,
 		ConfigDrive:      useConfigDrive,
 	}
 
@@ -248,83 +248,141 @@ func (ex *Executor) deployServer(machineName string, userData []byte, nws []serv
 		}
 	}
 
+	var (
+		blockDeviceOpts []bootfromvolume.BlockDevice
+	)
+
 	// If a custom block_device (root disk size is provided) we need to boot from volume
 	if rootDiskSize > 0 {
-		return ex.bootFromVolume(machineName, imageRef, createOpts)
+		rootBlockDevice, err := ex.ensureRootVolume(machineName, imageId)
+		if err != nil {
+			return nil, err
+		}
+		blockDeviceOpts = append(blockDeviceOpts, *rootBlockDevice)
+	}
+	dataDiskBlockDevice, err := ex.ensureDataVolumes(machineName)
+	if err != nil {
+		return nil, err
+	}
+	blockDeviceOpts = append(blockDeviceOpts, dataDiskBlockDevice...)
+
+	if len(blockDeviceOpts) > 0 {
+		createOpts = &bootfromvolume.CreateOptsExt{
+			CreateOptsBuilder: createOpts,
+			BlockDevice:       blockDeviceOpts,
+		}
+		return ex.Compute.BootFromVolume(createOpts)
 	}
 
 	return ex.Compute.CreateServer(createOpts)
 }
 
-func (ex *Executor) bootFromVolume(machineName, imageID string, createOpts servers.CreateOptsBuilder) (*servers.Server, error) {
-	blockDeviceOpts := make([]bootfromvolume.BlockDevice, 1)
+func (ex *Executor) ensureDataVolumes(machineName string) ([]bootfromvolume.BlockDevice, error) {
+	var (
+		blockDeviceOpts []bootfromvolume.BlockDevice
+	)
 
-	if ex.Config.Spec.RootDiskType != nil {
-		volumeID, err := ex.ensureVolume(machineName, imageID)
+	for _, d := range ex.Config.Spec.Disks {
+		// volumeId, err := ex.
+		volumeName := fmt.Sprintf("%s-%s", machineName, d.Name)
+		volumeId, err := ex.ensureVolume(volumeName, d.Size, d.Type, ex.Config.Spec.AvailabilityZone, "", d.Metadata)
 		if err != nil {
-			return nil, fmt.Errorf("failed to ensure volume [Name=%q]: %s", machineName, err)
+			return nil, fmt.Errorf("failed to ensure data volume [Name=%q]: %s", d.Name, err)
 		}
 
-		blockDeviceOpts[0] = bootfromvolume.BlockDevice{
-			UUID:                volumeID,
-			VolumeSize:          ex.Config.Spec.RootDiskSize,
-			BootIndex:           0,
-			DeleteOnTermination: true,
+		blockDeviceOpts = append(blockDeviceOpts, bootfromvolume.BlockDevice{
+			UUID:                volumeId,
+			BootIndex:           -1,
+			DeleteOnTermination: d.DeleteOnTermination,
 			SourceType:          "volume",
 			DestinationType:     "volume",
-		}
-	} else {
-		blockDeviceOpts[0] = bootfromvolume.BlockDevice{
-			UUID:                imageID,
+			// blockDeviceOpts = append(blockDeviceOpts, bootfromvolume.BlockDevice{
+			// 	VolumeSize:          d.Size,
+			// 	BootIndex:           -1,
+			// 	DeleteOnTermination: d.DeleteOnTermination,
+			// 	SourceType:          "blank",
+			// 	DestinationType:     "volume",
+			// Because volume type requires Compute API microversion 2.67 or later we won't use it for now.
+			// VolumeType: ex.Config.Spec.RootDiskType,
+		})
+	}
+	return blockDeviceOpts, nil
+}
+
+func (ex *Executor) ensureRootVolume(machineName string, imageId string) (*bootfromvolume.BlockDevice, error) {
+	if ex.Config.Spec.RootDiskType == nil {
+		return &bootfromvolume.BlockDevice{
+			UUID:                imageId,
 			VolumeSize:          ex.Config.Spec.RootDiskSize,
 			BootIndex:           0,
 			DeleteOnTermination: true,
 			SourceType:          "image",
 			DestinationType:     "volume",
-		}
+		}, nil
 	}
 
-	klog.V(3).Infof("[DEBUG] Block Device Options: %+v", blockDeviceOpts)
-	createOpts = &bootfromvolume.CreateOptsExt{
-		CreateOptsBuilder: createOpts,
-		BlockDevice:       blockDeviceOpts,
+	volumeId, err := ex.ensureVolume(
+		machineName,
+		ex.Config.Spec.RootDiskSize,
+		*ex.Config.Spec.RootDiskType,
+		ex.Config.Spec.AvailabilityZone,
+		imageId,
+		ex.Config.Spec.Tags,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure root volume [Name=%q]: %s", machineName, err)
 	}
-	return ex.Compute.BootFromVolume(createOpts)
+
+	return &bootfromvolume.BlockDevice{
+		UUID:                volumeId,
+		BootIndex:           0,
+		DeleteOnTermination: true,
+		SourceType:          "volume",
+		DestinationType:     "volume",
+		// Because volume type requires Compute API microversion 2.67 or later we won't use it for now.
+		// VolumeType: ex.Config.Spec.RootDiskType,
+	}, nil
 }
 
-func (ex *Executor) ensureVolume(name, imageID string) (string, error) {
+func (ex *Executor) ensureVolume(
+	name string,
+	size int,
+	volumeType string,
+	availabilityZone string,
+	imageId string,
+	metadata map[string]string) (string, error) {
 	var (
-		volumeID string
+		volumeId string
 		err      error
 	)
 
-	volumeID, err = ex.Storage.VolumeIDFromName(name)
+	volumeId, err = ex.Storage.VolumeIDFromName(name)
 	if err != nil && !client.IsNotFoundError(err) {
 		return "", err
 	}
 
 	if client.IsNotFoundError(err) {
 		volume, err := ex.Storage.CreateVolume(volumes.CreateOpts{
+			Size:             size,
+			AvailabilityZone: availabilityZone,
+			Metadata:         metadata,
 			Name:             name,
-			VolumeType:       *ex.Config.Spec.RootDiskType,
-			Size:             ex.Config.Spec.RootDiskSize,
-			ImageID:          imageID,
-			AvailabilityZone: ex.Config.Spec.AvailabilityZone,
-			Metadata:         ex.Config.Spec.Tags,
+			ImageID:          imageId,
+			VolumeType:       volumeType,
 		})
 		if err != nil {
 			return "", fmt.Errorf("failed to created volume [Name=%s]: %v", name, err)
 		}
-		volumeID = volume.ID
+		volumeId = volume.ID
 	}
 
 	pendingStatuses := []string{client.VolumeStatusCreating, client.VolumeStatusDownloading}
 	targetStatuses := []string{client.VolumeStatusAvailable}
-	if err := ex.waitForVolumeStatus(volumeID, pendingStatuses, targetStatuses, 600); err != nil {
+	if err := ex.waitForVolumeStatus(volumeId, pendingStatuses, targetStatuses, 600); err != nil {
 		return "", err
 	}
 
-	return volumeID, nil
+	return volumeId, nil
 }
 
 func (ex *Executor) waitForVolumeStatus(volumeID string, pending, target []string, secs int) error {

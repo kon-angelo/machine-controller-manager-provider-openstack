@@ -219,6 +219,19 @@ string
 and only one should be specified.</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>dataDisk</code></br>
+<em>
+<a href="#openstack.machine.gardener.cloud/v1alpha1.OpenStackDisk">
+[]OpenStackDisk
+</a>
+</em>
+</td>
+<td>
+<p>Disks is a list of (non-bootable) Disks that should be attached to the machine.</p>
+</td>
+</tr>
 </table>
 </td>
 </tr>
@@ -421,6 +434,93 @@ string
 <td>
 <p>Networks is a list of networks the instance should belong to. Networks is mutually exclusive with the NetworkID option
 and only one should be specified.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>dataDisk</code></br>
+<em>
+<a href="#openstack.machine.gardener.cloud/v1alpha1.OpenStackDisk">
+[]OpenStackDisk
+</a>
+</em>
+</td>
+<td>
+<p>Disks is a list of (non-bootable) Disks that should be attached to the machine.</p>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="openstack.machine.gardener.cloud/v1alpha1.OpenStackDisk">OpenStackDisk
+</h3>
+<p>
+(<em>Appears on:</em>
+<a href="#openstack.machine.gardener.cloud/v1alpha1.MachineProviderConfigSpec">MachineProviderConfigSpec</a>)
+</p>
+<p>
+<p>OpenStackDisk is the specification for a disk that should be attached to the machine.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>name</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>Name is the name of the volume</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>type</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>Type is the disk type for the volume. If left empty the default type will be used.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>metadata</code></br>
+<em>
+map[string]string
+</em>
+</td>
+<td>
+<p>Metadata is a list of key-value pairs used as metadata for the volume.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>size</code></br>
+<em>
+int
+</em>
+</td>
+<td>
+<p>Size is the size of the volume in GB.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>deleteOnTermination</code></br>
+<em>
+bool
+</em>
+</td>
+<td>
+<p>DeleteOnTermination indicates if the volume should be deleted on VM termination.</p>
 </td>
 </tr>
 </tbody>
